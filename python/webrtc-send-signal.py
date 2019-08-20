@@ -41,7 +41,8 @@ class WebRTCStreamer:
         self.sig_addr = signaling_address
         self.certpath = cert_path
         self.ice_message = []
-        self.msg_queue = Queue()
+        self.ice_queue = Queue()
+        self.sdp_queue = Queue()
 
     def on_offer_created(self, promise, _, __):
         promise.wait()
@@ -53,7 +54,7 @@ class WebRTCStreamer:
         text = offer.sdp.as_text()
         print ('Creating offer:\n%s' % text)
         msg = json.dumps({'type' : 'sdp','data': {'type': 'offer', 'sdp': text}})
-        self.msg_queue.put(msg)
+        self.sdp_queue.put(msg)
 
     def on_negotiation_needed(self, element):
         promise = Gst.Promise.new_with_change_func(self.on_offer_created, element, None)
@@ -62,7 +63,7 @@ class WebRTCStreamer:
     def send_ice_candidate_message(self, _, mlineindex, candidate):
         icemsg = json.dumps({'type' : 'ice', 'data': {'candidate': candidate, 'sdpMLineIndex': mlineindex}})
         print ('Creating ICE:\n%s' % icemsg)
-        self.msg_queue.put(icemsg)
+        self.ice_queue.put(icemsg)
 
     def start_pipeline(self):
         self.pipe = Gst.parse_launch(PIPELINE_DESC)
@@ -75,9 +76,10 @@ class WebRTCStreamer:
     async def connection_handler(self, ws):
         print("Connection attempt")
         self.current_ws = ws
-        self.start_pipeline()        
+        self.start_pipeline()
+        await ws.send(self.sdp_queue.get())    
         while True :
-            await ws.send(self.msg_queue.get())
+            await ws.send(self.ice_queue.get())
             msg = await ws.recv()
             msg = json.loads(msg)
             print(msg)
@@ -109,6 +111,7 @@ class WebRTCStreamer:
             await self.connection_handler(ws)
         except websockets.ConnectionClosed:
             self.pipe.set_state(Gst.State.NULL)
+            #del self.pipe
             print("Connection to peer {!r} closed, exiting handler")
 
     async def health_check(self, path, request_headers):
