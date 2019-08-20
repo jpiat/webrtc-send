@@ -16,7 +16,7 @@ var default_peer_id;
 var rtc_configuration = {iceServers: [{urls: "stun:stun.services.mozilla.com"},
                                       {urls: "stun:stun.l.google.com:19302"}]};
 // The default constraints that will be attempted. Can be overriden by the user.
-var default_constraints = {video: true, audio: true};
+var default_constraints = {video: true, audio: false};
 
 var connect_attempts = 0;
 var peer_connection;
@@ -59,14 +59,6 @@ function setError(text) {
 }
 
 function resetVideo() {
-    // Release the webcam and mic
-    if (local_stream_promise)
-        local_stream_promise.then(stream => {
-            if (stream) {
-                stream.getTracks().forEach(function (track) { track.stop(); });
-            }
-        });
-
     // Reset the video element and stop showing the last received frame
     var videoElement = getVideoElement();
     videoElement.pause();
@@ -81,26 +73,14 @@ function onIncomingSDP(sdp) {
         if (sdp.type != "offer")
             return;
         setStatus("Got SDP offer");
-        local_stream_promise.then((stream) => {
-            setStatus("Got local stream, creating answer");
-            peer_connection.createAnswer()
-            .then(onLocalDescription).catch(setError);
-        }).catch(setError);
+        peer_connection.createAnswer();
     }).catch(setError);
 }
 
-// Local description was set, send it to peer
-function onLocalDescription(desc) {
-    console.log("Got local description: " + JSON.stringify(desc));
-    peer_connection.setLocalDescription(desc).then(function() {
-        setStatus("Sending SDP answer");
-        sdp = {'sdp': peer_connection.localDescription}
-        ws_conn.send(JSON.stringify(sdp));
-    });
-}
 
 // ICE candidate received from peer, add it to the peer connection
 function onIncomingICE(ice) {
+    setStatus("Remote ICE set");
     var candidate = new RTCIceCandidate(ice);
     peer_connection.addIceCandidate(candidate).catch(setError);
 }
@@ -157,28 +137,9 @@ function onServerClose(event) {
 
 function onServerError(event) {
     setError("Unable to connect to server, did you add an exception for the certificate?")
+    console.log(event)
     // Retry after 3 seconds
     window.setTimeout(websocketServerConnect, 3000);
-}
-
-function getLocalStream() {
-    var constraints;
-    var textarea = document.getElementById('constraints');
-    try {
-        constraints = JSON.parse(textarea.value);
-    } catch (e) {
-        console.error(e);
-        setError('ERROR parsing constraints: ' + e.message + ', using default constraints');
-        constraints = default_constraints;
-    }
-    console.log(JSON.stringify(constraints));
-
-    // Add local stream
-    if (navigator.mediaDevices.getUserMedia) {
-        return navigator.mediaDevices.getUserMedia(constraints);
-    } else {
-        errorUserMediaHandler();
-    }
 }
 
 function websocketServerConnect() {
@@ -205,7 +166,7 @@ function websocketServerConnect() {
     } else {
         throw new Error ("Don't know how to connect to the signalling server with uri" + window.location);
     }
-    var ws_url = 'wss://' + ws_server + ':' + ws_port
+    var ws_url = 'ws://' + ws_server + ':' + ws_port
     setStatus("Connecting to server " + ws_url);
     ws_conn = new WebSocket(ws_url);
     /* When connected, immediately register with the server */
@@ -220,6 +181,7 @@ function websocketServerConnect() {
 }
 
 function onRemoteTrack(event) {
+    console.log('Incoming reomte track');
     if (getVideoElement().srcObject !== event.streams[0]) {
         console.log('Incoming stream');
         getVideoElement().srcObject = event.streams[0];
@@ -272,20 +234,21 @@ function createCall(msg) {
     console.log('Creating RTCPeerConnection');
 
     peer_connection = new RTCPeerConnection(rtc_configuration);
-    send_channel = peer_connection.createDataChannel('label', null);
+    /*send_channel = peer_connection.createDataChannel('label', null);
     send_channel.onopen = handleDataChannelOpen;
     send_channel.onmessage = handleDataChannelMessageReceived;
     send_channel.onerror = handleDataChannelError;
-    send_channel.onclose = handleDataChannelClose;
+    send_channel.onclose = handleDataChannelClose;*/
     peer_connection.ondatachannel = onDataChannel;
     peer_connection.ontrack = onRemoteTrack;
     /* Send our video/audio to the other peer */
-    local_stream_promise = getLocalStream().then((stream) => {
+    /*local_stream_promise = getLocalStream().then((stream) => {
         console.log('Adding local stream');
         peer_connection.addStream(stream);
         return stream;
-    }).catch(setError);
+    }).catch(setError);*/
 
+    peer_connection.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: true })
     if (!msg.sdp) {
         console.log("WARNING: First message wasn't an SDP message!?");
     }
@@ -297,7 +260,7 @@ function createCall(msg) {
             console.log("ICE Candidate was null, done");
             return;
 	}
-	ws_conn.send(JSON.stringify({'ice': event.candidate}));
+	//ws_conn.send(JSON.stringify({'ice': event.candidate}));
     };
 
     setStatus("Created peer connection for call, waiting for SDP");

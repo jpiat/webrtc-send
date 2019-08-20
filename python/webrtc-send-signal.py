@@ -19,10 +19,16 @@ from gi.repository import GstWebRTC
 gi.require_version('GstSdp', '1.0')
 from gi.repository import GstSdp
 
+#PIPELINE_DESC = '''
+#webrtcbin name=send bundle-policy=max-bundle
+# v4l2src device=/dev/video1 ! video/x-raw,format=YUY2,width=640,height=480,framerate=15/1 ! videoconvert ! queue ! x264enc pass=5 quantizer=21 ! rtph264pay !
+# queue ! application/x-rtp,media=video,encoding-name=H264,payload=97 ! send.
+#'''
+
 PIPELINE_DESC = '''
 webrtcbin name=send bundle-policy=max-bundle
- v4l2src device=/dev/video1 ! video/x-raw,format=YUY2,width=640,height=480,framerate=15/1 ! videoconvert ! queue ! x264enc pass=5 quantizer=21 ! rtph264pay !
- queue ! application/x-rtp,media=video,encoding-name=H264,payload=97 ! send.
+ videotestsrc is-live=true pattern=ball ! videoconvert ! queue ! vp8enc deadline=1 ! rtpvp8pay !
+ queue ! application/x-rtp,media=video,encoding-name=VP8,payload=97 ! send.
 '''
 
 KEEPALIVE_TIMEOUT = 30
@@ -86,14 +92,18 @@ class WebRTCStreamer:
 
     async def connection_handler(self, ws):
         session_opened = False
+        print("Connection attempt")
         #We shoudld handle incoming messages and send the SDP as soon as a session is opened
         while True:
             msg = await recv_msg_ping(ws, ws.remote_address)
             print("{!r} command {!r}".format(ws.remote_address, msg))
             if not session_opened :
-                if msg.startswith('SESSION'):
+                if msg.startswith('HELLO'):
+                    await ws.send('HELLO')
+                #if msg.startswith('SESSION'):
                     if self.sdp_offer and self.ice_message :
-                        await ws.send('SESSION_OK')
+                        #await ws.send('SESSION_OK')
+                        await asyncio.sleep(1)
                         await ws.send(self.sdp_offer) #Sending offer now that session is connected
                         await ws.send(self.ice_message)
                         session_opened = True
@@ -104,12 +114,11 @@ class WebRTCStreamer:
         '''
         All incoming messages are handled here. @path is unused.
         '''
-        raddr = ws.remote_address
-        print("Connected to {!r}".format(raddr))
         try:
+            print("Waiting for a connection")
             await self.connection_handler(ws)
         except websockets.ConnectionClosed:
-            print("Connection to peer {!r} closed, exiting handler".format(raddr))
+            print("Connection to peer {!r} closed, exiting handler")
 
     async def health_check(self, path, request_headers):
         return http.HTTPStatus.OK, [], b"OK\n"
@@ -129,7 +138,8 @@ class WebRTCStreamer:
         except FileNotFoundError:
             print("Certificates not found, did you run generate_cert.sh?")
             return
-        self.wsd = websockets.serve(self.handler, self.sig_addr, self.sig_port, ssl=sslctx, process_request=self.health_check, max_queue=16)
+        #self.wsd = websockets.serve(self.handler, self.sig_addr, self.sig_port, ssl=sslctx, process_request=self.health_check, max_queue=16)
+        self.wsd = websockets.serve(self.handler, self.sig_addr, self.sig_port)
         print("Listening on https://{}:{}".format(self.sig_addr, self.sig_port))
         asyncio.get_event_loop().run_until_complete(self.wsd)
         asyncio.get_event_loop().run_forever()
@@ -150,7 +160,7 @@ if __name__=='__main__':
     if not check_plugins():
         sys.exit(1)
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--addr', default='', help='Address to listen on (default: all interfaces, both ipv4 and ipv6)')
+    parser.add_argument('--addr', default='0.0.0.0', help='Address to listen on (default: all interfaces, both ipv4 and ipv6)')
     parser.add_argument('--port', default=8443, type=int, help='Port to listen on')
     parser.add_argument('--keepalive-timeout', dest='keepalive_timeout', default=30, type=int, help='Timeout for keepalive (in seconds)')
     parser.add_argument('--cert-path', default=os.path.dirname(__file__))
