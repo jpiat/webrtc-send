@@ -16,7 +16,7 @@ var default_peer_id;
 var rtc_configuration = {iceServers: [{urls: "stun:stun.services.mozilla.com"},
                                       {urls: "stun:stun.l.google.com:19302"}]};
 // The default constraints that will be attempted. Can be overriden by the user.
-var default_constraints = {video: true, audio: false};
+var default_constraints = {video: true, audio: true};
 
 var connect_attempts = 0;
 var peer_connection;
@@ -66,6 +66,14 @@ function resetVideo() {
     videoElement.load();
 }
 
+function onLocalDescription(desc) {
+    console.log("Local description: " + JSON.stringify(desc));
+    peer_connection.setLocalDescription(desc)
+    /*.then(function() {
+        ws_conn.send(JSON.stringify({ type: "sdp", "data": peer_connection.localDescription }));
+    }).catch(setError);*/
+  } 
+
 // SDP offer received from peer, set remote description and create an answer
 function onIncomingSDP(sdp) {
     peer_connection.setRemoteDescription(sdp).then(() => {
@@ -73,7 +81,7 @@ function onIncomingSDP(sdp) {
         if (sdp.type != "offer")
             return;
         setStatus("Got SDP offer");
-        peer_connection.createAnswer();
+        peer_connection.createAnswer().then(onLocalDescription).catch(setError);
     }).catch(setError);
 }
 
@@ -81,6 +89,7 @@ function onIncomingSDP(sdp) {
 // ICE candidate received from peer, add it to the peer connection
 function onIncomingICE(ice) {
     setStatus("Remote ICE set");
+    console.log(ice)
     var candidate = new RTCIceCandidate(ice);
     peer_connection.addIceCandidate(candidate).catch(setError);
 }
@@ -181,10 +190,12 @@ function websocketServerConnect() {
 }
 
 function onRemoteTrack(event) {
-    console.log('Incoming reomte track');
+    console.log('Incoming remote track');
     if (getVideoElement().srcObject !== event.streams[0]) {
         console.log('Incoming stream');
-        getVideoElement().srcObject = event.streams[0];
+        v_elt = getVideoElement()
+        v_elt.srcObject = event.streams[0];
+        console.log(v_elt);
     }
 }
 
@@ -234,20 +245,8 @@ function createCall(msg) {
     console.log('Creating RTCPeerConnection');
 
     peer_connection = new RTCPeerConnection(rtc_configuration);
-    /*send_channel = peer_connection.createDataChannel('label', null);
-    send_channel.onopen = handleDataChannelOpen;
-    send_channel.onmessage = handleDataChannelMessageReceived;
-    send_channel.onerror = handleDataChannelError;
-    send_channel.onclose = handleDataChannelClose;*/
     peer_connection.ondatachannel = onDataChannel;
     peer_connection.ontrack = onRemoteTrack;
-    /* Send our video/audio to the other peer */
-    /*local_stream_promise = getLocalStream().then((stream) => {
-        console.log('Adding local stream');
-        peer_connection.addStream(stream);
-        return stream;
-    }).catch(setError);*/
-
     peer_connection.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: true })
     if (!msg.sdp) {
         console.log("WARNING: First message wasn't an SDP message!?");

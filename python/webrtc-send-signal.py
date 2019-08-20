@@ -26,9 +26,9 @@ from gi.repository import GstSdp
 #'''
 
 PIPELINE_DESC = '''
-webrtcbin name=send bundle-policy=max-bundle
+webrtcbin name=sendrecv bundle-policy=max-bundle
  videotestsrc is-live=true pattern=ball ! videoconvert ! queue ! vp8enc deadline=1 ! rtpvp8pay !
- queue ! application/x-rtp,media=video,encoding-name=VP8,payload=97 ! send.
+ queue ! application/x-rtp,media=video,encoding-name=VP8,payload=97 ! sendrecv.
 '''
 
 KEEPALIVE_TIMEOUT = 30
@@ -59,7 +59,7 @@ class WebRTCStreamer:
         self.sig_port = signaling_port
         self.sig_addr = signaling_address
         self.certpath = cert_path
-        self.ice_message = None
+        self.ice_message = []
 
     def on_offer_created(self, promise, _, __):
         promise.wait()
@@ -80,11 +80,11 @@ class WebRTCStreamer:
     def send_ice_candidate_message(self, _, mlineindex, candidate):
         icemsg = json.dumps({'ice': {'candidate': candidate, 'sdpMLineIndex': mlineindex}})
         print ('Creating ICE:\n%s' % icemsg)
-        self.ice_message = icemsg
+        self.ice_message.append(icemsg)
 
     def start_pipeline(self):
         self.pipe = Gst.parse_launch(PIPELINE_DESC)
-        self.webrtc = self.pipe.get_by_name('send')
+        self.webrtc = self.pipe.get_by_name('sendrecv')
         self.webrtc.connect('on-negotiation-needed', self.on_negotiation_needed)
         self.webrtc.connect('on-ice-candidate', self.send_ice_candidate_message)
         self.pipe.set_state(Gst.State.PLAYING)
@@ -105,7 +105,8 @@ class WebRTCStreamer:
                         #await ws.send('SESSION_OK')
                         await asyncio.sleep(1)
                         await ws.send(self.sdp_offer) #Sending offer now that session is connected
-                        await ws.send(self.ice_message)
+                        for ice_candidate in self.ice_message :
+                            await ws.send(ice_candidate)
                         session_opened = True
                     else:
                         await ws.send('ERROR session is not ready yet')
@@ -125,20 +126,6 @@ class WebRTCStreamer:
 
     def loop(self):
         self.start_pipeline()
-        print('Using TLS with keys in {!r}'.format(self.certpath))
-        if 'letsencrypt' in self.certpath:
-            chain_pem = os.path.join(self.certpath, 'fullchain.pem')
-            key_pem = os.path.join(self.certpath, 'privkey.pem')
-        else:
-            chain_pem = os.path.join(self.certpath, 'cert.pem')
-            key_pem = os.path.join(self.certpath, 'key.pem')
-        sslctx = ssl.create_default_context()
-        try:
-            sslctx.load_cert_chain(chain_pem, keyfile=key_pem)
-        except FileNotFoundError:
-            print("Certificates not found, did you run generate_cert.sh?")
-            return
-        #self.wsd = websockets.serve(self.handler, self.sig_addr, self.sig_port, ssl=sslctx, process_request=self.health_check, max_queue=16)
         self.wsd = websockets.serve(self.handler, self.sig_addr, self.sig_port)
         print("Listening on https://{}:{}".format(self.sig_addr, self.sig_port))
         asyncio.get_event_loop().run_until_complete(self.wsd)
@@ -160,7 +147,7 @@ if __name__=='__main__':
     if not check_plugins():
         sys.exit(1)
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--addr', default='0.0.0.0', help='Address to listen on (default: all interfaces, both ipv4 and ipv6)')
+    parser.add_argument('--addr', default='127.0.0.1', help='Address to listen on (default: all interfaces, both ipv4 and ipv6)')
     parser.add_argument('--port', default=8443, type=int, help='Port to listen on')
     parser.add_argument('--keepalive-timeout', dest='keepalive_timeout', default=30, type=int, help='Timeout for keepalive (in seconds)')
     parser.add_argument('--cert-path', default=os.path.dirname(__file__))
