@@ -10,6 +10,7 @@ import os
 import sys
 import logging
 import http
+from queue import Queue
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -27,39 +28,20 @@ from gi.repository import GstSdp
 
 PIPELINE_DESC = '''
 webrtcbin name=sendrecv bundle-policy=max-bundle stun-server=stun:stun.l.google.com:19302
- v4l2src device=/dev/video1 ! video/x-h264, width=1920, height=1080, framerate=30/1 ! h264parse ! rtph264pay config-interval=-1 name=payloader !
+ v4l2src device=/dev/video1 ! video/x-h264, width=640, height=480, framerate=30/1 ! h264parse ! rtph264pay config-interval=-1 name=payloader !
  queue ! application/x-rtp,media=video,encoding-name=H264,payload=96 ! sendrecv.
 '''
-
-KEEPALIVE_TIMEOUT = 30
-
-async def recv_msg_ping(ws, raddr):
-    '''
-    Wait for a message forever, and send a regular ping to prevent bad routers
-    from closing the connection.
-    '''
-    msg = None
-    while msg is None:
-        try:
-            msg = await asyncio.wait_for(ws.recv(), KEEPALIVE_TIMEOUT)
-        except TimeoutError:
-            print('Sending keepalive ping to {!r} in recv'.format(raddr))
-            await ws.ping()
-    return msg
-
-
 
 class WebRTCStreamer:
 
     def __init__(self, signaling_port, signaling_address, cert_path):
         self.conn = None
         self.pipe = None
-        self.webrtc = None
-        self.sdp_offer = None
         self.sig_port = signaling_port
         self.sig_addr = signaling_address
         self.certpath = cert_path
         self.ice_message = []
+        self.msg_queue = Queue()
 
     def on_offer_created(self, promise, _, __):
         promise.wait()
@@ -71,7 +53,7 @@ class WebRTCStreamer:
         text = offer.sdp.as_text()
         print ('Creating offer:\n%s' % text)
         msg = json.dumps({'type' : 'sdp','data': {'type': 'offer', 'sdp': text}})
-        self.sdp_offer = msg
+        self.msg_queue.put(msg)
 
     def on_negotiation_needed(self, element):
         promise = Gst.Promise.new_with_change_func(self.on_offer_created, element, None)
@@ -80,7 +62,7 @@ class WebRTCStreamer:
     def send_ice_candidate_message(self, _, mlineindex, candidate):
         icemsg = json.dumps({'type' : 'ice', 'data': {'candidate': candidate, 'sdpMLineIndex': mlineindex}})
         print ('Creating ICE:\n%s' % icemsg)
-        self.ice_message.append(icemsg)
+        self.msg_queue.put(icemsg)
 
     def start_pipeline(self):
         self.pipe = Gst.parse_launch(PIPELINE_DESC)
@@ -92,13 +74,10 @@ class WebRTCStreamer:
 
     async def connection_handler(self, ws):
         print("Connection attempt")
-        if self.sdp_offer and self.ice_message :
-            print("Sending SDP")
-            await ws.send(self.sdp_offer) #Sending offer now that session is connected
-            await asyncio.sleep(1)
-            for ice_candidate in self.ice_message :
-                await ws.send(ice_candidate)
+        self.current_ws = ws
+        self.start_pipeline()        
         while True :
+            await ws.send(self.msg_queue.get())
             msg = await ws.recv()
             msg = json.loads(msg)
             print(msg)
@@ -113,10 +92,13 @@ class WebRTCStreamer:
                 self.webrtc.emit('set-remote-description', answer, promise)
                 promise.interrupt()
             if msg['type'] == 'ice':
+                print ('Received ICE:\n%s' % sdp)
                 ice = msg['data']
                 candidate = ice['candidate']
                 sdpmlineindex = ice['sdpMLineIndex']
                 self.webrtc.emit('add-ice-candidate', sdpmlineindex, candidate)
+            else:
+                print('Unsupported message type')
 
     async def handler(self, ws, path):
         '''
@@ -126,13 +108,14 @@ class WebRTCStreamer:
             print("Waiting for a connection")
             await self.connection_handler(ws)
         except websockets.ConnectionClosed:
+            self.pipe.set_state(Gst.State.NULL)
             print("Connection to peer {!r} closed, exiting handler")
 
     async def health_check(self, path, request_headers):
         return http.HTTPStatus.OK, [], b"OK\n"
 
     def loop(self):
-        self.start_pipeline()
+        #self.start_pipeline()
         self.wsd = websockets.serve(self.handler, self.sig_addr, self.sig_port)
         print("Listening on https://{}:{}".format(self.sig_addr, self.sig_port))
         asyncio.get_event_loop().run_until_complete(self.wsd)
