@@ -1,266 +1,90 @@
-/* vim: set sts=4 sw=4 et :
- *
- * Demo Javascript app for negotiating and streaming a sendrecv webrtc stream
- * with a GStreamer app. Runs only in passive mode, i.e., responds to offers
- * with answers, exchanges ICE candidates, and streams.
- *
- * Author: Nirbheek Chauhan <nirbheek@centricular.com>
- */
-
-// Set this to override the automatic detection in websocketServerConnect()
-var ws_server;
-var ws_port;
-// Set this to use a specific peer id instead of a random one
-var default_peer_id;
-// Override with your own STUN servers if you want
-var rtc_configuration = {iceServers: [{urls: "stun:stun.services.mozilla.com"},
-                                      {urls: "stun:stun.l.google.com:19302"}]};
-// The default constraints that will be attempted. Can be overriden by the user.
-var default_constraints = {video: true, audio: true};
-
-var connect_attempts = 0;
-var peer_connection;
-var send_channel;
-var ws_conn;
-// Promise for local stream after constraints are approved by the user
-var local_stream_promise;
-
-function getOurId() {
-    return Math.floor(Math.random() * (9000 - 10) + 10).toString();
-}
-
-function resetState() {
-    // This will call onServerClose()
-    ws_conn.close();
-}
-
-function handleIncomingError(error) {
-    setError("ERROR: " + error);
-    resetState();
-}
-
-function getVideoElement() {
-    return document.getElementById("stream");
-}
-
-function setStatus(text) {
-    console.log(text);
-    var span = document.getElementById("status")
-    // Don't set the status if it already contains an error
-    if (!span.classList.contains('error'))
-        span.textContent = text;
-}
-
-function setError(text) {
-    console.error(text);
-    var span = document.getElementById("status")
-    span.textContent = text;
-    span.classList.add('error');
-}
-
-function resetVideo() {
-    // Reset the video element and stop showing the last received frame
-    var videoElement = getVideoElement();
-    videoElement.pause();
-    videoElement.src = "";
-    videoElement.load();
-}
-
-function onLocalDescription(desc) {
-    console.log("Local description: " + JSON.stringify(desc));
-    peer_connection.setLocalDescription(desc)
-    /*.then(function() {
-        ws_conn.send(JSON.stringify({ type: "sdp", "data": peer_connection.localDescription }));
-    }).catch(setError);*/
-  } 
-
-// SDP offer received from peer, set remote description and create an answer
-function onIncomingSDP(sdp) {
-    peer_connection.setRemoteDescription(sdp).then(() => {
-        setStatus("Remote SDP set");
-        if (sdp.type != "offer")
-            return;
-        setStatus("Got SDP offer");
-        peer_connection.createAnswer().then(onLocalDescription).catch(setError);
-    }).catch(setError);
-}
+var html5VideoElement; 
+var websocketConnection; 
+var webrtcPeerConnection; 
+var webrtcConfiguration; 
+var reportError; 
 
 
-// ICE candidate received from peer, add it to the peer connection
-function onIncomingICE(ice) {
-    setStatus("Remote ICE set");
-    console.log(ice)
-    var candidate = new RTCIceCandidate(ice);
-    peer_connection.addIceCandidate(candidate).catch(setError);
-}
+function onLocalDescription(desc) { 
+    console.log("Local description: " + JSON.stringify(desc)); 
+    webrtcPeerConnection.setLocalDescription(desc).then(function() { 
+        websocketConnection.send(JSON.stringify({ type: "sdp", "data": webrtcPeerConnection.localDescription })); 
+    }).catch(reportError); 
+} 
 
-function onServerMessage(event) {
-    console.log("Received " + event.data);
-    switch (event.data) {
-        case "HELLO":
-            setStatus("Registered with server, waiting for call");
-            return;
-        default:
-            if (event.data.startsWith("ERROR")) {
-                handleIncomingError(event.data);
-                return;
-            }
-            // Handle incoming JSON SDP and ICE messages
-            try {
-                msg = JSON.parse(event.data);
-            } catch (e) {
-                if (e instanceof SyntaxError) {
-                    handleIncomingError("Error parsing incoming JSON: " + event.data);
-                } else {
-                    handleIncomingError("Unknown error parsing response: " + event.data);
-                }
-                return;
-            }
 
-            // Incoming JSON signals the beginning of a call
-            if (!peer_connection)
-                createCall(msg);
+function onIncomingSDP(sdp) { 
+    console.log("Incoming SDP: " + JSON.stringify(sdp)); 
+    webrtcPeerConnection.setRemoteDescription(sdp).catch(reportError); 
+    webrtcPeerConnection.createAnswer().then(onLocalDescription).catch(reportError); 
+} 
 
-            if (msg.sdp != null) {
-                onIncomingSDP(msg.sdp);
-            } else if (msg.ice != null) {
-                onIncomingICE(msg.ice);
-            } else {
-                handleIncomingError("Unknown incoming JSON: " + msg);
-            }
-    }
-}
 
-function onServerClose(event) {
-    setStatus('Disconnected from server');
-    resetVideo();
+function onIncomingICE(ice) { 
+    var candidate = new RTCIceCandidate(ice); 
+    console.log("Incoming ICE: " + JSON.stringify(ice)); 
+    webrtcPeerConnection.addIceCandidate(candidate).catch(reportError); 
+} 
 
-    if (peer_connection) {
-        peer_connection.close();
-        peer_connection = null;
-    }
 
-    // Reset after a second
-    window.setTimeout(websocketServerConnect, 1000);
-}
+function onAddRemoteStream(event) { 
+    html5VideoElement.srcObject = event.streams[0]; 
+} 
 
-function onServerError(event) {
-    setError("Unable to connect to server, did you add an exception for the certificate?")
-    console.log(event)
-    // Retry after 3 seconds
-    window.setTimeout(websocketServerConnect, 3000);
-}
 
-function websocketServerConnect() {
-    connect_attempts++;
-    if (connect_attempts > 3) {
-        setError("Too many connection attempts, aborting. Refresh page to try again");
-        return;
-    }
-    // Clear errors in the status span
-    var span = document.getElementById("status");
-    span.classList.remove('error');
-    span.textContent = '';
-    // Populate constraints
-    var textarea = document.getElementById('constraints');
-    if (textarea.value == '')
-        textarea.value = JSON.stringify(default_constraints);
-    // Fetch the peer id to use
-    peer_id = default_peer_id || getOurId();
-    ws_port = ws_port || '8443';
-    if (window.location.protocol.startsWith ("file")) {
-        ws_server = ws_server || "127.0.0.1";
-    } else if (window.location.protocol.startsWith ("http")) {
-        ws_server = ws_server || window.location.hostname;
-    } else {
-        throw new Error ("Don't know how to connect to the signalling server with uri" + window.location);
-    }
-    var ws_url = 'ws://' + ws_server + ':' + ws_port
-    setStatus("Connecting to server " + ws_url);
-    ws_conn = new WebSocket(ws_url);
-    /* When connected, immediately register with the server */
-    ws_conn.addEventListener('open', (event) => {
-        document.getElementById("peer-id").textContent = peer_id;
-        ws_conn.send('HELLO ' + peer_id);
-        setStatus("Registering with server");
-    });
-    ws_conn.addEventListener('error', onServerError);
-    ws_conn.addEventListener('message', onServerMessage);
-    ws_conn.addEventListener('close', onServerClose);
-}
+function onIceCandidate(event) { 
+    if (event.candidate == null) 
+    return; 
 
-function onRemoteTrack(event) {
-    console.log('Incoming remote track');
-    if (getVideoElement().srcObject !== event.streams[0]) {
-        console.log('Incoming stream');
-        v_elt = getVideoElement()
-        v_elt.srcObject = event.streams[0];
-        console.log(v_elt);
-    }
-}
+    console.log("Sending ICE candidate out: " + JSON.stringify(event.candidate)); 
+    websocketConnection.send(JSON.stringify({ "type": "ice", "data": event.candidate })); 
+} 
 
-function errorUserMediaHandler() {
-    setError("Browser doesn't support getUserMedia!");
-}
 
-const handleDataChannelOpen = (event) =>{
-    console.log("dataChannel.OnOpen", event);
-};
+function onServerMessage(event) { 
+    var msg; 
 
-const handleDataChannelMessageReceived = (event) =>{
-    console.log("dataChannel.OnMessage:", event, event.data.type);
+    try { 
+        msg = JSON.parse(event.data); 
+    } catch (e) { 
+        return; 
+    } 
 
-    setStatus("Received data channel message");
-    if (typeof event.data === 'string' || event.data instanceof String) {
-        console.log('Incoming string message: ' + event.data);
-        textarea = document.getElementById("text")
-        textarea.value = textarea.value + '\n' + event.data
-    } else {
-        console.log('Incoming data message');
-    }
-    send_channel.send("Hi! (from browser)");
-};
+    if (!webrtcPeerConnection) { 
+        webrtcPeerConnection = new RTCPeerConnection(webrtcConfiguration); 
+        webrtcPeerConnection.ontrack = onAddRemoteStream; 
+        webrtcPeerConnection.onicecandidate = onIceCandidate; 
+    } 
+    console.log(msg);
+    switch (msg.type) { 
+        case "sdp": onIncomingSDP(msg.data); break; 
+        case "ice": onIncomingICE(msg.data); break; 
+        default: 
+            console.log("Message not supported")
+            break; 
+    } 
+} 
 
-const handleDataChannelError = (error) =>{
-    console.log("dataChannel.OnError:", error);
-};
 
-const handleDataChannelClose = (event) =>{
-    console.log("dataChannel.OnClose", event);
-};
+function playStream(videoElement, hostname, port, path, configuration, reportErrorCB) { 
+var l = window.location;
+var wsHost = (hostname != undefined) ? hostname : l.hostname; 
+var wsPort = (port != undefined) ? port : 8443 ; 
+var wsPath = (path != undefined) ? path : "ws"; 
+if (wsPort) 
+wsPort = ":" + wsPort; 
+var wsUrl = "ws://" + wsHost + wsPort; 
+console.log(wsUrl);
+html5VideoElement = videoElement; 
+webrtcConfiguration = configuration; 
+reportError = (reportErrorCB != undefined) ? reportErrorCB : function(text) {}; 
 
-function onDataChannel(event) {
-    setStatus("Data channel created");
-    let receiveChannel = event.channel;
-    receiveChannel.onopen = handleDataChannelOpen;
-    receiveChannel.onmessage = handleDataChannelMessageReceived;
-    receiveChannel.onerror = handleDataChannelError;
-    receiveChannel.onclose = handleDataChannelClose;
-}
+websocketConnection = new WebSocket(wsUrl); 
+websocketConnection.addEventListener("message", onServerMessage); 
+} 
 
-function createCall(msg) {
-    // Reset connection attempts because we connected successfully
-    connect_attempts = 0;
-
-    console.log('Creating RTCPeerConnection');
-
-    peer_connection = new RTCPeerConnection(rtc_configuration);
-    peer_connection.ondatachannel = onDataChannel;
-    peer_connection.ontrack = onRemoteTrack;
-    peer_connection.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: true })
-    if (!msg.sdp) {
-        console.log("WARNING: First message wasn't an SDP message!?");
-    }
-
-    peer_connection.onicecandidate = (event) => {
-	// We have a candidate, send it to the remote party with the
-	// same uuid
-	if (event.candidate == null) {
-            console.log("ICE Candidate was null, done");
-            return;
-	}
-	//ws_conn.send(JSON.stringify({'ice': event.candidate}));
-    };
-
-    setStatus("Created peer connection for call, waiting for SDP");
-}
+window.onload = function() { 
+var vidstream = document.getElementById("stream"); 
+var config = { 'iceServers': [{ 'urls': 'stun:stun.l.google.com:19302' }] }; 
+playStream(vidstream, null, null, null, config, function (errmsg) { console.error(errmsg); }); 
+}; 

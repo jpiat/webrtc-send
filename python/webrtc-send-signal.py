@@ -26,9 +26,9 @@ from gi.repository import GstSdp
 #'''
 
 PIPELINE_DESC = '''
-webrtcbin name=sendrecv bundle-policy=max-bundle
- videotestsrc is-live=true pattern=ball ! videoconvert ! queue ! vp8enc deadline=1 ! rtpvp8pay !
- queue ! application/x-rtp,media=video,encoding-name=VP8,payload=97 ! sendrecv.
+webrtcbin name=sendrecv bundle-policy=max-bundle stun-server=stun:stun.l.google.com:19302
+ v4l2src device=/dev/video1 ! video/x-h264, width=1920, height=1080, framerate=30/1 ! h264parse ! rtph264pay config-interval=-1 name=payloader !
+ queue ! application/x-rtp,media=video,encoding-name=H264,payload=96 ! sendrecv.
 '''
 
 KEEPALIVE_TIMEOUT = 30
@@ -70,7 +70,7 @@ class WebRTCStreamer:
         promise.interrupt()
         text = offer.sdp.as_text()
         print ('Creating offer:\n%s' % text)
-        msg = json.dumps({'sdp': {'type': 'offer', 'sdp': text}})
+        msg = json.dumps({'type' : 'sdp','data': {'type': 'offer', 'sdp': text}})
         self.sdp_offer = msg
 
     def on_negotiation_needed(self, element):
@@ -78,7 +78,7 @@ class WebRTCStreamer:
         element.emit('create-offer', None, promise)
 
     def send_ice_candidate_message(self, _, mlineindex, candidate):
-        icemsg = json.dumps({'ice': {'candidate': candidate, 'sdpMLineIndex': mlineindex}})
+        icemsg = json.dumps({'type' : 'ice', 'data': {'candidate': candidate, 'sdpMLineIndex': mlineindex}})
         print ('Creating ICE:\n%s' % icemsg)
         self.ice_message.append(icemsg)
 
@@ -91,25 +91,32 @@ class WebRTCStreamer:
         print("Pipeline started")
 
     async def connection_handler(self, ws):
-        session_opened = False
         print("Connection attempt")
-        #We shoudld handle incoming messages and send the SDP as soon as a session is opened
-        while True:
-            msg = await recv_msg_ping(ws, ws.remote_address)
-            print("{!r} command {!r}".format(ws.remote_address, msg))
-            if not session_opened :
-                if msg.startswith('HELLO'):
-                    await ws.send('HELLO')
-                #if msg.startswith('SESSION'):
-                    if self.sdp_offer and self.ice_message :
-                        #await ws.send('SESSION_OK')
-                        await asyncio.sleep(1)
-                        await ws.send(self.sdp_offer) #Sending offer now that session is connected
-                        for ice_candidate in self.ice_message :
-                            await ws.send(ice_candidate)
-                        session_opened = True
-                    else:
-                        await ws.send('ERROR session is not ready yet')
+        if self.sdp_offer and self.ice_message :
+            print("Sending SDP")
+            await ws.send(self.sdp_offer) #Sending offer now that session is connected
+            await asyncio.sleep(1)
+            for ice_candidate in self.ice_message :
+                await ws.send(ice_candidate)
+        while True :
+            msg = await ws.recv()
+            msg = json.loads(msg)
+            print(msg)
+            if msg['type'] == 'sdp':
+                sdp = msg['data']
+                sdp = sdp['sdp']
+                print ('Received answer:\n%s' % sdp)
+                res, sdpmsg = GstSdp.SDPMessage.new()
+                GstSdp.sdp_message_parse_buffer(bytes(sdp.encode()), sdpmsg)
+                answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdpmsg)
+                promise = Gst.Promise.new()
+                self.webrtc.emit('set-remote-description', answer, promise)
+                promise.interrupt()
+            if msg['type'] == 'ice':
+                ice = msg['data']
+                candidate = ice['candidate']
+                sdpmlineindex = ice['sdpMLineIndex']
+                self.webrtc.emit('add-ice-candidate', sdpmlineindex, candidate)
 
     async def handler(self, ws, path):
         '''
